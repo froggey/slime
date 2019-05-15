@@ -81,15 +81,7 @@
 (defimplementation accept-connection (socket &key external-format
                                              buffering timeout)
   (declare (ignore external-format buffering timeout))
-  (loop
-     (let ((value (mezzano.supervisor:fifo-pop
-                   (slot-value socket '%connection-fifo)
-                   nil)))
-       (when value
-         (return value)))
-     ;; Poke standard-input every now and then to keep the console alive.
-     (listen)
-     (sleep 0.05)))
+  (mezzano.supervisor:fifo-pop (slot-value socket '%connection-fifo)))
 
 (defimplementation preferred-communication-style ()
   :spawn)
@@ -489,6 +481,7 @@
 (defstruct (mailbox (:conc-name mailbox.))
   thread
   (mutex (mezzano.supervisor:make-mutex))
+  (cvar (mezzano.supervisor:make-condition-variable))
   (queue '() :type list))
 
 (defun mailbox (thread)
@@ -510,14 +503,29 @@
            (push (sys.int::make-weak-pointer thread mb) *mailboxes*)
            (return mb)))))
 
+(defimplementation wake-thread (thread)
+  ;; WAKE-THREAD is currently only called via INTERRUPT-THREAD by
+  ;; QUEUE-THREAD-INTERRUPT and executed by the thread itself. No
+  ;; work is actually required to pull the thread out of the
+  ;; CONDITION-WAIT call in RECEIVE-IF. Interrupting a thread
+  ;; that's waiting on a cvar will cause a spurious wakeup.
+  ;; However, we should hit the condition variable anyway just in
+  ;; case WAKE-THREAD starts being called from other places in
+  ;; the future.
+  (when (not (eql (mezzano.supervisor:current-thread) thread))
+    (let* ((mbox (mailbox thread))
+           (mutex (mailbox.mutex mbox))
+           (cvar (mailbox.cvar mbox)))
+      (mezzano.supervisor:with-mutex (mutex)
+        (mezzano.supervisor:condition-notify cvar t)))))
+
 (defimplementation send (thread message)
   (let* ((mbox (mailbox thread))
          (mutex (mailbox.mutex mbox)))
     (mezzano.supervisor:with-mutex (mutex)
       (setf (mailbox.queue mbox)
-            (nconc (mailbox.queue mbox) (list message))))))
-
-(defvar *receive-if-sleep-time* 0.02)
+            (nconc (mailbox.queue mbox) (list message)))
+      (mezzano.supervisor:condition-notify (mailbox.cvar mbox) t))))
 
 (defimplementation receive-if (test &optional timeout)
   (let* ((mbox (mailbox (current-thread)))
@@ -531,8 +539,8 @@
            (when tail
              (setf (mailbox.queue mbox) (nconc (ldiff q tail) (cdr tail)))
              (return (car tail))))
-         (when (eq timeout t) (return (values nil t))))
-       (sleep *receive-if-sleep-time*))))
+         (when (eq timeout t) (return (values nil t)))
+         (mezzano.supervisor:condition-wait (mailbox.cvar mbox) mutex)))))
 
 (defvar *registered-threads* (make-hash-table))
 (defvar *registered-threads-lock*
